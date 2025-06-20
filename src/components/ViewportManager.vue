@@ -1,58 +1,81 @@
+// NASA JPL: Advanced viewport management for Olympus 3D system integration
 <template>
-  <div 
-    class="viewport-container"
-    :class="{ 
-      'enlarged': isEnlarged,
-      'resizing': isResizing 
-    }"
-    :style="viewportStyle"
-  >
-    <!-- NASA JPL: Resize handle for real-time viewport adjustment -->
-    <div 
-      class="resize-handle"
-      @mousedown="startResize"
-      @touchstart="startResize"
-    >
-      <div class="resize-grip"></div>
-    </div>
-    
-    <!-- NASA JPL: Content wrapper with swap animation -->
-    <div class="viewport-content">
-      <!-- Dynamic content area -->
-      <div class="viewport-display" v-if="currentContent">
-        <component :is="currentContent" v-bind="currentProps" />
+  <div class="viewport-manager" :class="{ active: isActive }">
+    <!-- Primary viewport controls -->
+    <div class="viewport-controls">
+      <div class="view-toggle-group">
+        <button 
+          v-for="view in viewModes" 
+          :key="view.id"
+          @click="setViewMode(view.id)"
+          :class="['view-btn', { active: currentView === view.id }]"
+          :disabled="!view.available"
+        >
+          <i :class="view.icon"></i>
+          {{ view.label }}
+        </button>
       </div>
       
-      <!-- Empty state -->
-      <div v-else class="viewport-empty">
-        <div class="empty-content">
-          <div class="empty-icon">📊</div>
-          <h3>No Content Active</h3>
-          <p>Select a view from the control panel</p>
+      <!-- Viewport size controls -->
+      <div class="size-controls">
+        <label>Viewport Size:</label>
+        <select v-model="selectedSize" @change="updateViewportSize">
+          <option v-for="size in availableSizes" :key="size.name" :value="size">
+            {{ size.name }} ({{ size.width }}x{{ size.height }})
+          </option>
+        </select>
+      </div>
+    </div>
+    
+    <!-- Active viewport container -->
+    <div 
+      ref="viewportContainer" 
+      class="viewport-container"
+      :style="containerStyle"
+    >
+      <iframe 
+        v-if="currentView === '3d'"
+        ref="olympusFrame"
+        :src="olympusUrl"
+        class="olympus-frame"
+        @load="handleOlympusLoad"
+      ></iframe>
+      
+      <div v-else-if="currentView === '2d'" class="map-viewport">
+        <LeafletMap 
+          :height="selectedSize.height"
+          :width="selectedSize.width"
+          :telemetry="telemetry"
+        />
+      </div>
+      
+      <div v-else-if="currentView === 'split'" class="split-viewport">
+        <div class="split-left">
+          <LeafletMap 
+            :height="selectedSize.height"
+            :width="selectedSize.width / 2"
+            :telemetry="telemetry"
+          />
+        </div>
+        <div class="split-right">
+          <iframe 
+            :src="olympusUrl"
+            class="olympus-frame split-frame"
+            @load="handleOlympusLoad"
+          ></iframe>
         </div>
       </div>
     </div>
     
-    <!-- NASA JPL: Mission Planning Overlay -->
-    <div 
-      v-if="showMissionPlanning"
-      class="mission-planning-overlay"
-      @click="closeMissionPlanning"
-    >
-      <div class="mission-planning-content" @click.stop>
-        <button 
-          class="close-button"
-          @click="closeMissionPlanning"
-          aria-label="Close Mission Planning"
-        >
-          <X :size="20" />
-        </button>
-        
-        <h2>Mission Planning Interface</h2>
-        <div class="planning-tools">
-          <!-- Mission planning tools would go here -->
-          <p>Mission planning interface coming soon...</p>
-        </div>
+    <!-- Viewport status indicators -->
+    <div class="viewport-status">
+      <div class="status-item" :class="{ active: olympusConnected }">
+        <i class="icon-3d"></i>
+        <span>Olympus 3D: {{ olympusConnected ? 'Connected' : 'Disconnected' }}</span>
+      </div>
+      <div class="status-item" :class="{ active: mapLoaded }">
+        <i class="icon-map"></i>
+        <span>Map: {{ mapLoaded ? 'Loaded' : 'Loading' }}</span>
       </div>
     </div>
   </div>
@@ -60,399 +83,345 @@
 
 <script setup lang="ts">
 import { ref, computed, reactive, watch, onUnmounted } from 'vue'
-import { X } from 'lucide-vue-next'
+import LeafletMap from './LeafletMap.vue'
+import { useMavLink } from '../services/MAVLinkService'
 
-// NASA JPL: Type definitions with validation
+// NASA JPL: Rule 6 - Data objects declared at smallest possible scope
+interface ViewMode {
+  id: string
+  label: string
+  icon: string
+  available: boolean
+}
+
 interface ViewportSize {
+  name: string
   width: number
   height: number
 }
 
-interface ViewportPosition {
-  x: number
-  y: number
-}
-
+// Props
 interface Props {
-  defaultSize?: ViewportSize
-  minSize?: ViewportSize
-  maxSize?: ViewportSize
-  hideComponents?: string[]
-  enableMissionPlanning?: boolean
+  isActive?: boolean
+  defaultView?: string
+  olympusUrl?: string
 }
 
-interface Emits {
-  (e: 'size-change', size: ViewportSize): void
-  (e: 'content-swap', content: string): void
-  (e: 'mission-planning-open'): void
-  (e: 'mission-planning-close'): void
-}
-
-// NASA JPL: Props with safe defaults
 const props = withDefaults(defineProps<Props>(), {
-  defaultSize: () => ({ width: 800, height: 600 }),
-  minSize: () => ({ width: 320, height: 240 }),
-  maxSize: () => ({ width: 1920, height: 1080 }),
-  hideComponents: () => [],
-  enableMissionPlanning: false
+  isActive: true,
+  defaultView: '2d',
+  olympusUrl: '/olympus-3d-test.html'
 })
 
-const emit = defineEmits<Emits>()
+// Reactive state
+const currentView = ref(props.defaultView)
+const olympusConnected = ref(false)
+const mapLoaded = ref(false)
+const viewportContainer = ref<HTMLElement>()
+const olympusFrame = ref<HTMLIFrameElement>()
 
-// NASA JPL: Reactive state with bounds checking
-const currentSize = ref<ViewportSize>({ ...props.defaultSize })
-const isResizing = ref<boolean>(false)
-const isEnlarged = ref<boolean>(false)
-const currentContent = ref<string | null>(null)
-const currentProps = ref<Record<string, any>>({})
-const showMissionPlanning = ref<boolean>(false)
+// MAVLink integration
+const { telemetry } = useMavLink()
 
-// NASA JPL: Touch/Mouse interaction state
-const touchState = reactive({
-  startPos: { x: 0, y: 0 },
-  lastTap: 0,
-  tapCount: 0
-})
+// Available view modes
+const viewModes = reactive<ViewMode[]>([
+  { id: '2d', label: '2D Map', icon: 'icon-map', available: true },
+  { id: '3d', label: '3D View', icon: 'icon-3d', available: true },
+  { id: 'split', label: 'Split View', icon: 'icon-split', available: true }
+])
 
-// NASA JPL: Timing controls with bounded operations
-const tapTimer = ref<ReturnType<typeof setTimeout> | null>(null)
-const longPressTimer = ref<ReturnType<typeof setTimeout> | null>(null)
-const DOUBLE_TAP_DELAY = 300 // ms
-const LONG_PRESS_DELAY = 800 // ms
+// Available viewport sizes
+const availableSizes = reactive<ViewportSize[]>([
+  { name: 'Small', width: 800, height: 600 },
+  { name: 'Medium', width: 1024, height: 768 },
+  { name: 'Large', width: 1280, height: 960 },
+  { name: 'Full HD', width: 1920, height: 1080 }
+])
 
-// NASA JPL: Computed viewport styling
-const viewportStyle = computed(() => ({
-  width: `${currentSize.value.width}px`,
-  height: `${currentSize.value.height}px`,
-  maxWidth: `${props.maxSize.width}px`,
-  maxHeight: `${props.maxSize.height}px`,
-  minWidth: `${props.minSize.width}px`,
-  minHeight: `${props.minSize.height}px`
+const selectedSize = ref<ViewportSize>(availableSizes[1]) // Default to Medium
+
+// Computed styles
+const containerStyle = computed(() => ({
+  width: `${selectedSize.value.width}px`,
+  height: `${selectedSize.value.height}px`
 }))
 
-// NASA JPL: Safe size validation
-function validateSize(size: ViewportSize): ViewportSize {
-  return {
-    width: Math.max(props.minSize.width, Math.min(props.maxSize.width, size.width)),
-    height: Math.max(props.minSize.height, Math.min(props.maxSize.height, size.height))
-  }
-}
-
-// NASA JPL: Resize handling with bounds
-function startResize(event: MouseEvent | TouchEvent): void {
-  event.preventDefault()
-  isResizing.value = true
-  
-  const startX = 'touches' in event ? event.touches[0].clientX : event.clientX
-  const startY = 'touches' in event ? event.touches[0].clientY : event.clientY
-  const startSize = { ...currentSize.value }
-  
-  function handleResize(e: MouseEvent | TouchEvent): void {
-    if (!isResizing.value) return
-    
-    const currentX = 'touches' in e ? e.touches[0].clientX : e.clientX
-    const currentY = 'touches' in e ? e.touches[0].clientY : e.clientY
-    
-    const deltaX = currentX - startX
-    const deltaY = currentY - startY
-    
-    const newSize = validateSize({
-      width: startSize.width + deltaX,
-      height: startSize.height + deltaY
-    })
-    
-    currentSize.value = newSize
-    emit('size-change', newSize)
-  }
-  
-  function stopResize(): void {
-    isResizing.value = false
-    document.removeEventListener('mousemove', handleResize)
-    document.removeEventListener('mouseup', stopResize)
-    document.removeEventListener('touchmove', handleResize)
-    document.removeEventListener('touchend', stopResize)
-  }
-  
-  document.addEventListener('mousemove', handleResize)
-  document.addEventListener('mouseup', stopResize)
-  document.addEventListener('touchmove', handleResize)
-  document.addEventListener('touchend', stopResize)
-}
-
-// NASA JPL: Content swapping with validation
-function swapContent(contentType: string, contentProps: Record<string, any> = {}): void {
-  // Validate content type
-  if (typeof contentType !== 'string' || contentType.length === 0) {
-    console.warn('Invalid content type provided to viewport')
+// NASA JPL: Rule 7 - Check inputs for validity
+function setViewMode(viewId: string): void {
+  const mode = viewModes.find(m => m.id === viewId)
+  if (!mode || !mode.available) {
+    console.warn(`Invalid or unavailable view mode: ${viewId}`)
     return
   }
   
-  currentContent.value = contentType
-  currentProps.value = { ...contentProps }
-  emit('content-swap', contentType)
+  currentView.value = viewId
+  
+  // NASA JPL: Rule 9 - Handle edge cases
+  if (viewId === '3d' || viewId === 'split') {
+    // Ensure Olympus frame loads properly
+    setTimeout(() => {
+      if (olympusFrame.value) {
+        checkOlympusConnection()
+      }
+    }, 100)
+  }
 }
 
-// NASA JPL: Touch gesture handling
-function handleTouchStart(event: TouchEvent): void {
-  if (event.touches.length !== 1) return
+function updateViewportSize(): void {
+  // NASA JPL: Rule 7 - Validate size constraints
+  if (selectedSize.value.width < 400 || selectedSize.value.height < 300) {
+    console.warn('Viewport size too small, using minimum dimensions')
+    selectedSize.value = { name: 'Minimum', width: 400, height: 300 }
+  }
   
-  const touch = event.touches[0]
-  touchState.startPos = { x: touch.clientX, y: touch.clientY }
-  
-  // Start long press timer
-  longPressTimer.value = setTimeout(() => {
-    handleLongPress()
-  }, LONG_PRESS_DELAY)
+  // Trigger viewport resize
+  emitViewportResize()
 }
 
-function handleTouchEnd(event: TouchEvent): void {
-  cancelLongPress()
+function handleOlympusLoad(): void {
+  olympusConnected.value = true
+  console.log('Olympus 3D viewport loaded successfully')
   
-  const now = Date.now()
-  const timeSinceLastTap = now - touchState.lastTap
-  
-  if (timeSinceLastTap < DOUBLE_TAP_DELAY) {
-    touchState.tapCount++
-    if (touchState.tapCount === 2) {
-      handleDoubleTap()
-      touchState.tapCount = 0
-      return
+  // NASA JPL: Rule 3 - Set bounds on loops
+  setTimeout(() => {
+    checkOlympusConnection()
+  }, 500)
+}
+
+// NASA JPL: Rule 7 - Check connection status
+function checkOlympusConnection(): void {
+  try {
+    if (olympusFrame.value?.contentWindow) {
+      // Test if frame is responsive
+      olympusFrame.value.contentWindow.postMessage({ type: 'ping' }, '*')
+      
+      // NASA JPL: Rule 2 - Bound the wait time
+      setTimeout(() => {
+        if (!olympusConnected.value) {
+          console.warn('Olympus 3D connection timeout')
+          markOlympusDisconnected()
+        }
+      }, 3000)
     }
-  } else {
-    touchState.tapCount = 1
+  } catch (error) {
+    console.error('Error checking Olympus connection:', error)
+    markOlympusDisconnected()
   }
-  
-  touchState.lastTap = now
-  
-  // Single tap timer
-  if (tapTimer.value) {
-    clearTimeout(tapTimer.value)
-  }
-  
-  tapTimer.value = setTimeout(() => {
-    if (touchState.tapCount === 1) {
-      handleSingleTap()
+}
+
+function markOlympusDisconnected(): void {
+  olympusConnected.value = false
+  viewModes.find(m => m.id === '3d')!.available = false
+  viewModes.find(m => m.id === 'split')!.available = false
+}
+
+// NASA JPL: Rule 9 - Handle communication errors
+function emitViewportResize(): void {
+  try {
+    const event = new CustomEvent('viewport-resize', {
+      detail: {
+        width: selectedSize.value.width,
+        height: selectedSize.value.height,
+        view: currentView.value
+      }
+    })
+    
+    if (viewportContainer.value) {
+      viewportContainer.value.dispatchEvent(event)
     }
-    touchState.tapCount = 0
-  }, DOUBLE_TAP_DELAY)
-}
-
-function handleSingleTap(): void {
-  // Single tap action
-  console.log('Viewport single tap')
-}
-
-function handleDoubleTap(): void {
-  // Toggle enlarged view
-  isEnlarged.value = !isEnlarged.value
-  
-  if (isEnlarged.value) {
-    currentSize.value = { ...props.maxSize }
-  } else {
-    currentSize.value = { ...props.defaultSize }
-  }
-  
-  emit('size-change', currentSize.value)
-}
-
-function handleLongPress(): void {
-  // Open mission planning if enabled
-  if (props.enableMissionPlanning) {
-    showMissionPlanning.value = true
-    emit('mission-planning-open')
+  } catch (error) {
+    console.error('Error emitting viewport resize event:', error)
   }
 }
 
-function cancelLongPress(): void {
-  if (longPressTimer.value) {
-    clearTimeout(longPressTimer.value)
-    longPressTimer.value = null
+// Watch for telemetry changes to update map
+watch(() => telemetry.lat, () => {
+  if (currentView.value === '2d' || currentView.value === 'split') {
+    mapLoaded.value = true
+  }
+})
+
+// NASA JPL: Rule 8 - Use static memory allocation patterns
+const messageHandler = (event: MessageEvent) => {
+  if (event.data?.type === 'pong') {
+    olympusConnected.value = true
   }
 }
 
-// NASA JPL: Mission planning controls
-function openMissionPlanning(): void {
-  if (props.enableMissionPlanning) {
-    showMissionPlanning.value = true
-    emit('mission-planning-open')
-  }
-}
+// Setup message listener for Olympus communication
+window.addEventListener('message', messageHandler)
 
-function closeMissionPlanning(): void {
-  showMissionPlanning.value = false
-  emit('mission-planning-close')
-}
-
-// NASA JPL: Cleanup on unmount
+// NASA JPL: Rule 5 - Clean up resources
 onUnmounted(() => {
-  cancelLongPress()
-  if (tapTimer.value) {
-    clearTimeout(tapTimer.value)
-  }
+  window.removeEventListener('message', messageHandler)
+  olympusConnected.value = false
+  mapLoaded.value = false
+})
+
+// Expose methods for parent components
+defineExpose({
+  setViewMode,
+  updateViewportSize,
+  getCurrentView: () => currentView.value,
+  getViewportSize: () => selectedSize.value
 })
 </script>
 
 <style scoped>
+.viewport-manager {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  padding: 1rem;
+  background: var(--color-background-soft);
+  border-radius: 8px;
+  border: 1px solid var(--color-border);
+}
+
+.viewport-controls {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.5rem;
+  background: var(--color-background);
+  border-radius: 6px;
+}
+
+.view-toggle-group {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.view-btn {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  background: var(--color-background-mute);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.view-btn:hover:not(:disabled) {
+  background: var(--color-background-soft);
+  border-color: var(--color-border-hover);
+}
+
+.view-btn.active {
+  background: var(--color-primary);
+  color: white;
+  border-color: var(--color-primary);
+}
+
+.view-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.size-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.size-controls label {
+  font-weight: 500;
+  color: var(--color-text-soft);
+}
+
+.size-controls select {
+  padding: 0.25rem 0.5rem;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: var(--color-background);
+}
+
 .viewport-container {
   position: relative;
-  border: 2px solid rgb(var(--border));
+  border: 2px solid var(--color-border);
   border-radius: 8px;
-  background: rgb(var(--background));
   overflow: hidden;
+  background: #000;
   transition: all 0.3s ease;
-  user-select: none;
 }
 
-.viewport-container.enlarged {
-  z-index: 100;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-}
-
-.viewport-container.resizing {
-  transition: none;
-}
-
-.resize-handle {
-  position: absolute;
-  bottom: 0;
-  right: 0;
-  width: 20px;
-  height: 20px;
-  cursor: se-resize;
-  z-index: 10;
-  background: rgb(var(--muted));
-  border-top-left-radius: 4px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.resize-handle:hover {
-  background: rgb(var(--accent));
-}
-
-.resize-grip {
-  width: 8px;
-  height: 8px;
-  background: rgb(var(--foreground));
-  border-radius: 1px;
-  opacity: 0.6;
-}
-
-.viewport-content {
+.olympus-frame {
   width: 100%;
   height: 100%;
-  position: relative;
-  overflow: hidden;
-}
-
-.viewport-display {
-  width: 100%;
-  height: 100%;
-}
-
-.viewport-empty {
-  width: 100%;
-  height: 100%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: rgb(var(--muted-foreground));
-}
-
-.empty-content {
-  text-align: center;
-  padding: 2rem;
-}
-
-.empty-icon {
-  font-size: 3rem;
-  margin-bottom: 1rem;
-}
-
-.empty-content h3 {
-  font-size: 1.25rem;
-  font-weight: 600;
-  margin-bottom: 0.5rem;
-  color: rgb(var(--foreground));
-}
-
-.empty-content p {
-  font-size: 0.875rem;
-  opacity: 0.7;
-}
-
-.mission-planning-overlay {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  background: rgba(0, 0, 0, 0.8);
-  z-index: 1000;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  animation: fadeIn 0.2s ease;
-}
-
-.mission-planning-content {
-  background: rgb(var(--background));
-  border: 1px solid rgb(var(--border));
-  border-radius: 12px;
-  padding: 2rem;
-  max-width: 80vw;
-  max-height: 80vh;
-  position: relative;
-  box-shadow: 0 25px 80px rgba(0, 0, 0, 0.3);
-}
-
-.close-button {
-  position: absolute;
-  top: 1rem;
-  right: 1rem;
-  background: transparent;
   border: none;
-  color: rgb(var(--muted-foreground));
-  cursor: pointer;
+}
+
+.map-viewport {
+  width: 100%;
+  height: 100%;
+  position: relative;
+}
+
+.split-viewport {
+  display: flex;
+  width: 100%;
+  height: 100%;
+}
+
+.split-left,
+.split-right {
+  flex: 1;
+  position: relative;
+}
+
+.split-frame {
+  width: 100%;
+  height: 100%;
+}
+
+.viewport-status {
+  display: flex;
+  gap: 1rem;
   padding: 0.5rem;
+  background: var(--color-background);
+  border-radius: 6px;
+  font-size: 0.875rem;
+}
+
+.status-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.25rem 0.5rem;
   border-radius: 4px;
   transition: all 0.2s ease;
 }
 
-.close-button:hover {
-  background: rgb(var(--muted));
-  color: rgb(var(--foreground));
+.status-item.active {
+  background: var(--color-success-background);
+  color: var(--color-success);
 }
 
-.mission-planning-content h2 {
-  margin: 0 0 1.5rem 0;
-  color: rgb(var(--foreground));
-  font-size: 1.5rem;
-  font-weight: 600;
+.status-item:not(.active) {
+  background: var(--color-warning-background);
+  color: var(--color-warning);
 }
 
-.planning-tools {
-  min-height: 200px;
-  color: rgb(var(--muted-foreground));
-}
+/* Icons */
+.icon-map::before { content: '🗺️'; }
+.icon-3d::before { content: '🌐'; }
+.icon-split::before { content: '⚡'; }
 
-@keyframes fadeIn {
-  from { opacity: 0; }
-  to { opacity: 1; }
-}
-
-/* Responsive adjustments */
 @media (max-width: 768px) {
-  .resize-handle {
-    width: 24px;
-    height: 24px;
+  .viewport-controls {
+    flex-direction: column;
+    gap: 0.5rem;
   }
   
-  .mission-planning-content {
-    max-width: 95vw;
-    max-height: 95vh;
-    padding: 1.5rem;
+  .view-toggle-group {
+    flex-wrap: wrap;
+  }
+  
+  .split-viewport {
+    flex-direction: column;
   }
 }
 </style>

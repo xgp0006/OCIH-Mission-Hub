@@ -1,291 +1,230 @@
+// NASA JPL: Bounded printer management store
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import type { PrinterStatus, PrinterSettings, PrintJob } from '@/types'
-import { validator, validateIPAddress, validatePort } from '@/utils/nasa-validators'
-import { safeForEach } from '@/utils/safe-loops'
-import { APP_CONFIG } from '@/types'
-import { useFeatureToggle } from '@/composables/useFeatureToggle'
-import { safeTauriInvoke, isTauriEnvironment } from '@/utils/tauri-guard'
 
-// NASA JPL: Tauri integration is handled by tauri-guard utility
+// NASA JPL: Rule 6 - Declare data objects at smallest scope
+interface PrinterStatus {
+  id: string
+  name: string
+  state: 'idle' | 'printing' | 'paused' | 'error' | 'offline'
+  progress: number
+  temperature: {
+    extruder: number
+    bed: number
+  }
+  estimatedTime: number
+  lastUpdate: number
+}
+
+interface PrintJob {
+  id: string
+  filename: string
+  progress: number
+  timeRemaining: number
+  startTime: number
+}
 
 export const usePrintersStore = defineStore('printers', () => {
-  // NASA JPL: Bounded collections
+  // State
   const printers = ref<PrinterStatus[]>([])
-  const activePrintJob = ref<PrintJob | null>(null)
-  const printQueue = ref<PrintJob[]>([])
+  const activePrintJobs = ref<PrintJob[]>([])
+  const isLoading = ref(false)
+  const error = ref<string | null>(null)
+  const selectedPrinterId = ref<string | null>(null)
   
-  // NASA JPL: Polling management with timeout
+  // NASA JPL: Rule 2 - Bounded polling with timeout
   const pollingInterval = ref<ReturnType<typeof setInterval> | null>(null)
+  const pollingStartTime = ref<number>(Date.now())
   const maxPollingDuration = 30 * 60 * 1000 // 30 minutes max
-  const pollingStartTime = ref<number>(0)
+  const isPolling = ref(false)
   
-  // NASA JPL: Computed properties
-  const availablePrinters = computed(() => 
-    printers.value.filter(p => p.status === 'idle')
+  // Computed
+  const activePrinters = computed(() => 
+    printers.value.filter(p => p.state !== 'offline')
   )
   
-  const activePrinters = computed(() =>
-    printers.value.filter(p => p.status === 'active')
+  const selectedPrinter = computed(() => 
+    printers.value.find(p => p.id === selectedPrinterId.value)
   )
   
-  const printerStatuses = computed(() =>
-    printers.value.map(p => p.status)
-  )
+  const totalProgress = computed(() => {
+    if (activePrintJobs.value.length === 0) return 0
+    const total = activePrintJobs.value.reduce((sum, job) => sum + job.progress, 0)
+    return Math.round(total / activePrintJobs.value.length)
+  })
   
-  // NASA JPL: Load printer status with error handling
+  // NASA JPL: Rule 7 - Check all inputs
+  function addPrinter(printer: Omit<PrinterStatus, 'lastUpdate'>): void {
+    if (!printer.id || !printer.name) {
+      console.error('Invalid printer data: missing id or name')
+      return
+    }
+    
+    const existingIndex = printers.value.findIndex(p => p.id === printer.id)
+    const newPrinter: PrinterStatus = {
+      ...printer,
+      lastUpdate: Date.now()
+    }
+    
+    if (existingIndex >= 0) {
+      printers.value[existingIndex] = newPrinter
+    } else {
+      printers.value.push(newPrinter)
+    }
+  }
+  
+  function removePrinter(printerId: string): void {
+    if (!printerId) return
+    
+    const index = printers.value.findIndex(p => p.id === printerId)
+    if (index >= 0) {
+      printers.value.splice(index, 1)
+      
+      // Clear selection if removed printer was selected
+      if (selectedPrinterId.value === printerId) {
+        selectedPrinterId.value = null
+      }
+    }
+  }
+  
+  function updatePrinterStatus(printerId: string, updates: Partial<PrinterStatus>): void {
+    if (!printerId) return
+    
+    const printer = printers.value.find(p => p.id === printerId)
+    if (printer) {
+      Object.assign(printer, updates, { lastUpdate: Date.now() })
+    }
+  }
+  
+  function selectPrinter(printerId: string | null): void {
+    selectedPrinterId.value = printerId
+  }
+  
+  // NASA JPL: Rule 2 - Bounded operations
   async function loadPrinterStatus(): Promise<void> {
-    try {
-      if (isTauriEnvironment()) {
-        const mockData = createMockPrinterStatus()
-        const result = await safeTauriInvoke<PrinterStatus[]>('get_printer_status', undefined, mockData)
-        
-        // NASA JPL: Validate array bounds
-        if (Array.isArray(result) && result.length <= APP_CONFIG.max_printers) {
-          printers.value = result
-        } else {
-          console.warn('Printer data exceeds maximum allowed printers')
-          printers.value = mockData
-        }
-      } else {
-        // Running in browser without Tauri
-        console.warn('Running without Tauri - using mock data')
-        printers.value = createMockPrinterStatus()
-      }
-    } catch (error) {
-      console.error('Failed to load printer status:', error)
-      printers.value = createMockPrinterStatus()
-    }
-  }
-  
-  // NASA JPL: Update printer settings with validation
-  async function updatePrinterSettings(printerId: string, settings: PrinterSettings): Promise<boolean> {
-    try {
-      // NASA JPL: Input validation
-      if (!printerId || typeof printerId !== 'string') {
-        console.error('Invalid printer ID provided')
-        return false
-      }
-      
-      // NASA JPL: Validate IP and port
-      if (!validateIPAddress(settings.ip_address)) {
-        console.error('Invalid IP address format')
-        return false
-      }
-      
-      if (!validatePort(settings.port)) {
-        console.error('Invalid port number')
-        return false
-      }
-      
-      if (isTauriEnvironment()) {
-        const result = await safeTauriInvoke<boolean>('update_printer_settings', {
-          printer_id: printerId,
-          settings: settings
-        }, true)
-        
-        if (result) {
-          // Refresh printer status after update
-          await loadPrinterStatus()
-        }
-        
-        return result
-      } else {
-        // Mock success in browser mode
-        console.log('Mock: Updated printer settings for', printerId)
-        return true
-      }
-    } catch (error) {
-      console.error('Failed to update printer settings:', error)
-      return false
-    }
-  }
-  
-  // NASA JPL: Start print job with queue management
-  async function startPrintJob(printerId: string, filename: string): Promise<boolean> {
-    try {
-      // NASA JPL: Input validation
-      if (!printerId || !filename) {
-        console.error('Missing required parameters for print job')
-        return false
-      }
-      
-      // NASA JPL: Check filename length
-      if (filename.length > APP_CONFIG.max_filename_length) {
-        console.error('Filename exceeds maximum length')
-        return false
-      }
-      
-      // NASA JPL: Check queue size
-      if (printQueue.value.length >= APP_CONFIG.max_print_queue) {
-        console.error('Print queue is at maximum capacity')
-        return false
-      }
-      
-      const jobId = `job_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
-      
-      const printJob: PrintJob = {
-        id: jobId,
-        filename: filename,
-        printer_id: printerId,
-        progress: 0,
-        status: 'queued'
-      }
-      
-      if (isTauriEnvironment()) {
-        const result = await safeTauriInvoke<boolean>('start_print_job', {
-          printer_id: printerId,
-          filename: filename,
-          job_id: jobId
-        }, true)
-        
-        if (result) {
-          printQueue.value.push(printJob)
-          activePrintJob.value = printJob
-        }
-        
-        return result
-      } else {
-        // Mock success in browser mode
-        console.log('Mock: Started print job', filename, 'on printer', printerId)
-        printQueue.value.push(printJob)
-        activePrintJob.value = printJob
-        return true
-      }
-    } catch (error) {
-      console.error('Failed to start print job:', error)
-      return false
-    }
-  }
-  
-  // NASA JPL: Monitor print progress
-  async function startPrintMonitoring(): Promise<void> {
-    if (typeof window === 'undefined' || !window.__TAURI__) return // Skip on server or web
+    if (isLoading.value) return
     
     try {
-      // Listen for print job updates
-      const { listen } = await import('@tauri-apps/api/event')
+      isLoading.value = true
+      error.value = null
       
-      await listen<{ job_id: string; progress: number; status: string }>('print-progress', (event) => {
-        const { job_id, progress, status } = event.payload
-        
-        // Update active job
-        if (activePrintJob.value && activePrintJob.value.id === job_id) {
-          activePrintJob.value.progress = Math.max(0, Math.min(100, progress))
-          activePrintJob.value.status = status as PrintJob['status']
-        }
-        
-        // Update job in queue
-        const queueJob = printQueue.value.find(job => job.id === job_id)
-        if (queueJob) {
-          queueJob.progress = Math.max(0, Math.min(100, progress))
-          queueJob.status = status as PrintJob['status']
-        }
-        
-        // Clear active job if completed
-        if (status === 'completed' || status === 'failed') {
-          if (activePrintJob.value && activePrintJob.value.id === job_id) {
-            activePrintJob.value = null
-          }
-        }
-      })
+      // NASA JPL: Rule 3 - Limit data processing
+      const maxPrinters = 10
       
-      // Set up status refresh interval with global reference for cleanup
-      const interval = setInterval(() => {
-        loadPrinterStatus()
-      }, 10000) // Every 10 seconds
+      // Simulate API call with timeout
+      const response = await Promise.race([
+        fetchPrintersFromAPI(),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Timeout')), 5000)
+        )
+      ]) as PrinterStatus[]
       
-      // Store interval globally for cleanup
-      ;(window as any).__printInterval = interval
-    } catch (error) {
-      console.warn('Failed to start print monitoring:', error)
+      if (response.length > maxPrinters) {
+        console.warn(`Too many printers (${response.length}), limiting to ${maxPrinters}`)
+        printers.value = response.slice(0, maxPrinters)
+      } else {
+        printers.value = response
+      }
       
-      // Fallback polling
-      const interval = setInterval(() => {
-        loadPrinterStatus()
-      }, 15000) // Every 15 seconds as fallback
-      
-      ;(window as any).__printInterval = interval
+    } catch (err) {
+      error.value = err instanceof Error ? err.message : 'Failed to load printer status'
+      console.error('Error loading printer status:', err)
+    } finally {
+      isLoading.value = false
     }
   }
   
-  // NASA JPL: Initialize store with bounded polling
-  async function initialize(): Promise<void> {
-    await loadPrinterStatus()
-    await startPrintMonitoring()
-    
-    // Start bounded polling
-    startPolling()
-  }
-  
-  // NASA JPL: Bounded polling with timeout
+  // NASA JPL: Rule 2 - Bounded polling with cleanup
   function startPolling(): void {
-    // Clear existing interval
-    if (pollingInterval.value) {
-      clearInterval(pollingInterval.value)
-    }
+    if (isPolling.value) return
     
     pollingStartTime.value = Date.now()
+    isPolling.value = true
     
     pollingInterval.value = setInterval(() => {
-      // NASA JPL Rule 2: Check bounds
+      // NASA JPL: Rule 2 - Check bounds
       if (Date.now() - pollingStartTime.value > maxPollingDuration) {
+        console.log('Polling timeout reached, stopping polling')
         stopPolling()
-        console.warn('Printer polling stopped after maximum duration')
         return
       }
       
       loadPrinterStatus()
-    }, 5000)
+    }, 2000) // Poll every 2 seconds
   }
   
-  // NASA JPL: Clean polling cleanup
   function stopPolling(): void {
     if (pollingInterval.value) {
       clearInterval(pollingInterval.value)
       pollingInterval.value = null
     }
+    isPolling.value = false
   }
   
-  // NASA JPL: Create mock printer data for web mode
-  function createMockPrinterStatus(): PrinterStatus[] {
-    return [
-      {
-        id: 'printer_1',
-        name: 'Printer 1',
-        status: 'idle',
-        ip_address: '192.168.1.100',
-        port: 80
-      },
-      {
-        id: 'printer_2', 
-        name: 'Printer 2',
-        status: 'active',
-        ip_address: '192.168.1.101',
-        port: 80
-      },
-      {
-        id: 'printer_3',
-        name: 'Printer 3', 
-        status: 'error',
-        ip_address: '192.168.1.102',
-        port: 80
-      }
-    ]
+  // NASA JPL: Rule 9 - Handle all possible outcomes
+  async function fetchPrintersFromAPI(): Promise<PrinterStatus[]> {
+    try {
+      // Simulate API call - replace with actual implementation
+      await new Promise(resolve => setTimeout(resolve, 500))
+      
+      // Mock data
+      return [
+        {
+          id: 'printer-1',
+          name: 'Ender 3 Pro',
+          state: 'printing',
+          progress: 75,
+          temperature: { extruder: 210, bed: 60 },
+          estimatedTime: 1800,
+          lastUpdate: Date.now()
+        },
+        {
+          id: 'printer-2', 
+          name: 'Prusa MK3S',
+          state: 'idle',
+          progress: 0,
+          temperature: { extruder: 25, bed: 25 },
+          estimatedTime: 0,
+          lastUpdate: Date.now()
+        }
+      ]
+    } catch (error) {
+      console.error('Failed to fetch printers:', error)
+      throw error
+    }
   }
-
+  
+  // NASA JPL: Rule 5 - Clean up resources
+  function cleanup(): void {
+    stopPolling()
+    printers.value = []
+    activePrintJobs.value = []
+    selectedPrinterId.value = null
+    error.value = null
+  }
+  
   return {
+    // State
     printers,
-    activePrintJob,
-    printQueue,
-    availablePrinters,
+    activePrintJobs,
+    isLoading,
+    error,
+    selectedPrinterId,
+    isPolling,
+    
+    // Computed
     activePrinters,
-    printerStatuses,
+    selectedPrinter,
+    totalProgress,
+    
+    // Actions
+    addPrinter,
+    removePrinter,
+    updatePrinterStatus,
+    selectPrinter,
     loadPrinterStatus,
-    updatePrinterSettings,
-    startPrintJob,
-    initialize,
     startPolling,
-    stopPolling
+    stopPolling,
+    cleanup
   }
 })
